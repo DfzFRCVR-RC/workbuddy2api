@@ -68,10 +68,14 @@ def verify_admin_token(token: str | None):
         if payload.get("sub") != settings.ADMIN_USERNAME:
             raise HTTPException(status_code=401, detail="无效令牌")
         # 改密码即失效：令牌里的密码指纹必须与当前密码一致。
-        # 老令牌（本机制上线前签发）没有 pv 字段，直接判为无效，要求重新登录。
-        pv = payload.get("pv")
-        if pv is None or pv != _password_stamp():
-            raise HTTPException(status_code=401, detail="密码已变更，请重新登录")
+        # 例外：local_shell 是桌面/安卓原生壳的免密通道（仅本地运行时可用，
+        # 且必须无 exp），它本就与密码登录无关，不能因改密被误伤。
+        is_local_shell = (local_runtime and payload.get("local_shell") is True
+                          and "exp" not in payload)
+        if not is_local_shell:
+            pv = payload.get("pv")
+            if pv is None or pv != _password_stamp():
+                raise HTTPException(status_code=401, detail="密码已变更，请重新登录")
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="无效令牌")
 
