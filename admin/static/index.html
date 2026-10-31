@@ -1595,6 +1595,7 @@ function uiSelectSet(id, value, notify = true) {
 const $ = (s) => document.querySelector(s);
 const TOKEN_KEY = "wb_admin_token";
 let TOKEN = localStorage.getItem(TOKEN_KEY) || "";
+let _loggingOut = false;  // 防止 401 连续触发多次 reload
 // 桌面托盘的「在浏览器中打开」会带一次性 JWT（?token=）：普通浏览器没有 pywebview 桥，
 // ?desktop=1 的免密通道走不通。取到即存 localStorage 并清掉参数，避免 token 留在地址栏/历史里。
 (() => {
@@ -1651,6 +1652,13 @@ async function api(path, opts = {}) {
       opts.headers['X-Admin-Token'] = TOKEN;
       response = await fetch(path, opts);
     } catch (_) {}
+  }
+  // 普通浏览器：令牌失效（例如刚改过密码）时立刻退回登录页，
+  // 不要让界面停留在“看着还登录着”的假状态。
+  if (response.status === 401 && !localShell && !_loggingOut) {
+    _loggingOut = true;
+    TOKEN = ""; localStorage.removeItem(TOKEN_KEY);
+    location.reload();
   }
   return response;
 }
@@ -4025,8 +4033,8 @@ function openExport() {
     </div>
     <label class="block text-sm mb-3">导出格式
       <select id="expFormat" class="w-full border rounded-lg px-3 py-2 mt-2">
-        <option value="client">官方新版加密凭证集（.jsonl）</option>
-        <option value="backup">系统明文备份（.jsonl）</option>
+        <option value="backup" selected>系统明文备份（.jsonl）</option>
+        <option value="client">官方新版加密凭证集（.jsonl，需服务器配置加密能力）</option>
       </select>
     </label>
     <label class="flex items-center gap-2 text-sm mb-3">
@@ -4053,7 +4061,15 @@ async function _fetchExport() {
     body: JSON.stringify({ ids: [], include_disabled: !!inc, format: $('#expFormat')?.value || 'client' })
   });
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) { toast("导出失败：" + (d.detail || r.status), "err"); return null; }
+  if (!r.ok) {
+    // 未配置官方客户端加密能力时，自动回退为明文备份重试一次，避免用户卡死
+    if (r.status === 409 && ($('#expFormat')?.value || 'client') === 'client') {
+      $('#expFormat').value = 'backup';
+      toast("加密导出不可用，已自动切换为明文备份重试", "err");
+      return _fetchExport();
+    }
+    toast("导出失败：" + (d.detail || r.status), "err"); return null;
+  }
   if (!d.items || !d.items.length) { toast("没有可导出的账号", "err"); return null; }
   return d;
 }
@@ -4091,8 +4107,13 @@ async function copyExport() {
 
 /** 导出单个账号。 */
 async function exportAcc(id, name) {
-  const r = await api(`/api/accounts/${id}/export?format=client`);
-  const d = await r.json().catch(() => ({}));
+  let r = await api(`/api/accounts/${id}/export?format=client`);
+  let d = await r.json().catch(() => ({}));
+  if (!r.ok && r.status === 409) {
+    // 未配置加密能力：自动降级为明文备份，保证导出可用
+    r = await api(`/api/accounts/${id}/export?format=backup`);
+    d = await r.json().catch(() => ({}));
+  }
   if (!r.ok) { toast("导出失败：" + (d.detail || r.status), "err"); return; }
   const safe = String(name || d.name || d.uid || id).replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
   try {
@@ -5114,7 +5135,12 @@ async function changePassword(){
   if(np.length<6){ toast("新密码至少6位","err"); return; }
   if(np!==np2){ toast("两次输入不一致","err"); return; }
   const r=await api("/api/admin/password",{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({old_password:oldP,new_password:np})});
-  if(r.ok){ toast("密码已修改，下次登录生效"); $("#oldPwd").value=$("#newPwd").value=$("#newPwd2").value=""; }
+  if(r.ok){
+    toast("密码已修改，请用新密码重新登录");
+    $("#oldPwd").value=$("#newPwd").value=$("#newPwd2").value="";
+    // 改密即登出：旧令牌已在服务端失效，这里同步清掉本地凭据并回到登录页。
+    setTimeout(() => { TOKEN = ""; localStorage.removeItem(TOKEN_KEY); location.reload(); }, 800);
+  }
   else { const d=await r.json().catch(()=>({})); toast("修改失败: "+(d.detail||""),"err"); }
 }
 

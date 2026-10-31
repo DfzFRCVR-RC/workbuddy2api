@@ -27,6 +27,7 @@ from admin.gateway_limits import GatewayAdmissionMiddleware
 from admin.routers import releases
 from admin.routers import growth_center
 from admin.routers import benefits
+from admin.routers import credit_balance
 from admin import credit_journal  # register transactional balance observations
 from admin.routers import maintenance
 
@@ -142,6 +143,8 @@ app.include_router(logs.router)
 app.include_router(groups.router)
 app.include_router(stats.router)
 app.include_router(credits.router)
+# 用 API Key 自查额度的公开接口（/credits、/v1/credits），供客户端显示余额
+app.include_router(credit_balance.router)
 app.include_router(maintenance.router)
 app.include_router(growth.router)
 app.include_router(growth_center.router)
@@ -275,55 +278,78 @@ def _startup():
         pass
 
 
+#: system_settings 中记录「上一次从 .env 播种的密码哈希」的键。
+#: 用途：区分「运维改了 .env」和「用户在后台改了密码」这两种情况。
+_ENV_PW_FP_KEY = "admin_password_env_fp"
+
+
 def _get_stored_hash() -> str:
-    """读取密码哈希；显式配置 ADMIN_PASSWORD 时以 env 为准并同步数据库。
+    """读取后台密码哈希。
+
+    优先级（修复点）：
+      1. 数据库里的哈希是**唯一事实来源**，后台「修改密码」写进去后重启不会丢。
+      2. 只有在「.env 里的 ADMIN_PASSWORD 相对上次播种发生了变化」时，
+         才用 .env 覆盖数据库 —— 这样运维改 .env 依然立即生效。
+
+    旧实现只要 .env 里有 ADMIN_PASSWORD 就无条件覆盖数据库，导致后台改密
+    在重启后被静默回滚。此处用 `admin_password_env_fp` 记录上次播种的
+    哈希指纹来消除这个歧义。
 
     返回空串表示「未配置登录凭据」——此时 login 一律拒绝，绝不允许空口令登录。
     """
-    # 未配置密码：直接拒绝，且不往库里写任何东西
-    if not settings.ADMIN_PASSWORD:
-        return ""
-
     db = None
     try:
         db = SessionLocal()
         row = db.query(SystemSetting).filter(SystemSetting.key == "admin_password").first()
+        fp_row = db.query(SystemSetting).filter(SystemSetting.key == _ENV_PW_FP_KEY).first()
+        env_pw = settings.ADMIN_PASSWORD or ""
 
-        # env 是部署配置的明确来源，优先级高于数据库中可能遗留的旧密码。
-        if settings.ADMIN_PASSWORD_FROM_ENV:
-            if row and row.value and verify_password(settings.ADMIN_PASSWORD, row.value):
-                return row.value
-            val = hash_password(settings.ADMIN_PASSWORD)
+        # ---- 情况 A：.env 显式给了密码 ----
+        if env_pw:
+            # 判断 .env 是否相对上次播种发生了变更
+            env_changed = True
+            if fp_row and fp_row.value:
+                env_changed = not verify_password(env_pw, fp_row.value)
+
+            if row and row.value and not env_changed:
+                # .env 没变 → 数据库说了算（后台改的密码得以保留）
+                val = row.value
+                if not val.startswith("pbkdf2$"):  # 旧明文 → 迁移为哈希
+                    val = hash_password(val)
+                    row.value = val
+                    db.commit()
+                return val
+
+            # .env 变了（或库里还没有）→ .env 覆盖数据库，并更新指纹
+            val = hash_password(env_pw)
             if row:
                 row.value = val
             else:
                 db.add(SystemSetting(key="admin_password", value=val))
+            if fp_row:
+                fp_row.value = val
+            else:
+                db.add(SystemSetting(key=_ENV_PW_FP_KEY, value=val))
             db.commit()
+            logger.info("后台密码已按 .env 的 ADMIN_PASSWORD 同步（来源：环境配置）")
             return val
 
+        # ---- 情况 B：.env 没给密码，但库里有历史哈希 ----
+        # 允许沿用库里的密码，避免删掉 .env 那行就把自己锁在门外。
         if row and row.value:
             val = row.value
-            if not val.startswith("pbkdf2$"):  # 旧明文 → 迁移为哈希
+            if not val.startswith("pbkdf2$"):
                 val = hash_password(val)
                 row.value = val
                 db.commit()
+            logger.warning("ADMIN_PASSWORD 未在 .env 中配置，使用数据库中的后台密码")
             return val
     finally:
         if db is not None:
             db.close()
-    # 无记录：用配置密码并持久化哈希
-    h = hash_password(settings.ADMIN_PASSWORD)
-    db = None
-    try:
-        db = SessionLocal()
-        db.add(SystemSetting(key="admin_password", value=h))
-        db.commit()
-    except Exception:
-        pass
-    finally:
-        if db is not None:
-            db.close()
-    return h
+
+    # ---- 情况 C：两处都没有凭据 → 拒绝登录（不退化成空口令）----
+    return ""
 
 
 @app.post("/api/login")
@@ -382,6 +408,12 @@ def change_password(body: PasswordChangeIn, _: bool = Depends(require_admin)):
         db.commit()
     finally:
         db.close()
+    # 让此前签发的管理令牌立即失效（改密即登出）
+    try:
+        from admin.security import invalidate_password_stamp
+        invalidate_password_stamp()
+    except Exception:
+        pass
     return {"ok": True}
 
 

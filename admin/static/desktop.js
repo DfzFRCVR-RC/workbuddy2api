@@ -16,7 +16,8 @@ window.WBDesktop = (() => {
   };
   const link = (text, url) => {
     const el = element('a', text);
-    if (/^https:\/\/github\.com\/xiaofan6ya\/workbuddy2api\/releases(?:\/|$)/.test(url)) {
+    // 只允许 http(s) 与 GitHub Releases 链接，防止后端返回的 url 被注入成 javascript:
+    if (typeof url === 'string' && /^https:\/\/(github\.com|api\.github\.com)\//.test(url)) {
       el.href = url; el.target = '_blank'; el.rel = 'noopener noreferrer';
     }
     return el;
@@ -61,7 +62,7 @@ window.WBDesktop = (() => {
     dialog.append(header, element('p', `当前版本 v${releases?.version || '…'} · 更新由你决定`, 'wb-update-meta'));
     if (releases?.error) dialog.append(element('p', releases.error, 'wb-update-meta'));
     const actions = element('div', undefined, 'wb-update-actions');
-    actions.append(button('重新检查', () => check()), link('打开 Releases', 'https://github.com/xiaofan6ya/workbuddy2api/releases'));
+    actions.append(button('重新检查', () => check()), link('打开 Releases', releases?.releases_url || ''));
     const latest = releases?.latest;
     if (!native && latest?.asset) {
       actions.append(link(window.WBMobile ? '下载最新版 APK' : '下载最新版 EXE', latest.asset.browser_download_url));
