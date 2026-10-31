@@ -2,6 +2,11 @@ name: Build Windows desktop
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: '构建后发布到 Releases（勾选后会用当前版本号创建/更新 Release）'
+        type: boolean
+        default: false
   push:
     tags: ['v*']
 
@@ -62,7 +67,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/')
+    # tag 推送自动发布；手动触发则需勾选 publish
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish == true
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -75,11 +81,22 @@ jobs:
           name: WorkBuddy2API-windows-x64
           path: dist
 
+      - name: Resolve version
+        id: ver
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION=$(python3 -c "import json;print(json.load(open('desktop/version.json'))['version'])")
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
       - name: Resolve release notes
         id: notes
         run: |
-          VERSION="${{ github.ref_name }}"
-          VERSION="${VERSION#v}"
+          VERSION="${{ steps.ver.outputs.version }}"
           NOTES="docs/RELEASE_NOTES_${VERSION}.md"
           if [ -f "$NOTES" ]; then
             echo "body_path=$NOTES" >> "$GITHUB_OUTPUT"
@@ -90,6 +107,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: v${{ steps.ver.outputs.version }}
           files: dist/*
           body_path: ${{ steps.notes.outputs.body_path }}
           generate_release_notes: ${{ steps.notes.outputs.body_path == '' }}
